@@ -1,0 +1,353 @@
+# A template to build a private EC2 instance with FTP server for access over a Tailscale VPN.
+# Public instance provides access to private subnet by advertising subnet on Tailscale network.
+# Private instance uses egress only internet gateway to install FTP server and NFS/EFS packages.
+# VPC endpoints are used for private instance to connect to SSM, KMS & EFS.
+# Tailscale auth key and FTP password are stored in SSM for aws cli access in user data.
+# Private instance uses EFS to provide elastic storage for FTP server.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates VPC with public & private subnet and EC2 instances for Tailscale VPN.
+
+Parameters:
+# Grab the most recent AMI for Amazon Linux 2.
+  LatestAmiId:
+    Description: "AMI for EC2"
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+# Resources block starts here.
+Resources:
+# Create VPC for Tailscale project and assign 10.16.0.0/16 cidr block.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.16.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  IPv6CidrBlock:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AmazonProvidedIpv6CidrBlock: true
+
+# Create custom route table with explicit subnet associations.
+  TailscaleRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: TailscaleRT
+
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGW
+    Properties:
+      RouteTableId: !Ref TailscaleRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateRT
+
+  EgressRoute:
+    Type: AWS::EC2::Route
+    DependsOn: EOIGW
+    Properties:
+      RouteTableId: !Ref PrivateRT
+      DestinationIpv6CidrBlock: ::0/0
+      EgressOnlyInternetGatewayId: !Ref EOIGW
+
+  PublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref TailscaleRT
+
+  PrivateSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRT
+
+# Security group for SSH access to public subnet.
+  TailscaleRelay:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Implicitly deny all inbound traffic except SSH.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: TailscaleRelay
+
+# Security group to allow traffic from the TailscaleRelay SG.
+  PrivateSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: PrivateSG
+      GroupDescription: Allow traffic from the TailscaleRelay SG.
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateSG
+
+  PrivateSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt PrivateSG.GroupId
+      Description: Ingress rule to allow traffic from Tailscale relay security group.
+      IpProtocol: -1
+      SourceSecurityGroupId: !GetAtt TailscaleRelay.GroupId
+
+# Allows SSM to communicate back to private instance.
+  PrivateSGSSMIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt PrivateSG.GroupId
+      Description: Ingress rule to allow traffic from SSM.
+      CidrIp: 10.16.0.0/20
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  EFSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: EFSSG
+      GroupDescription: EFS Security Group.
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: EFSSG
+
+  EFSIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt EFSSG.GroupId
+      Description: Ingress rule to allow traffic from the private EC2 instance.
+      IpProtocol: -1
+      SourceSecurityGroupId: !GetAtt PrivateSG.GroupId
+
+# Creates role for SSM & EFS access.
+  SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemFullAccess
+
+  # Instance profile for aws cli access. Uses SSMRole.
+  SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SSMRole
+
+# EFS volume for private FTP server
+  EFSVolume:
+    Type: AWS::EFS::FileSystem
+
+  MountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSVolume
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroups:
+      - !Ref EFSSG
+
+# VPC Endpoints to provide private instance access to SSM, EFS & KMS.
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !Ref PrivateSG
+      SubnetIds: 
+        - !Ref PrivateSubnet
+      ServiceName: com.amazonaws.us-east-1.ssm
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  KMSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !Ref PrivateSG
+      SubnetIds: 
+        - !Ref PrivateSubnet
+      ServiceName: com.amazonaws.us-east-1.kms
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  EFSEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      PrivateDnsEnabled: true
+      SecurityGroupIds: 
+        - !Ref PrivateSG
+      SubnetIds: 
+        - !Ref PrivateSubnet
+      ServiceName: com.amazonaws.us-east-1.elasticfilesystem
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+# EC2 instance which will serve as a router to private subnet. 
+# User data will install Tailscale VPN and connect programmatically via authkey stored in SSM.
+  TailscaleRouter:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      KeyName: PEMKEY
+      InstanceType: t2.micro
+      Monitoring: false
+      SecurityGroupIds:
+        - !Ref TailscaleRelay
+      UserData: !Base64 |
+        #!/bin/bash
+        echo 'net.ipv4.ip_forward = 1' | sudo tee -a /etc/sysctl.conf
+        echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.conf
+        sysctl -p /etc/sysctl.conf
+        yum install -y yum-utils
+        yum install -y ftp
+        yum-config-manager --add-repo https://pkgs.tailscale.com/stable/amazon-linux/2/tailscale.repo
+        yum install -y tailscale
+        systemctl enable --now tailscaled
+        TAILSCALEAUTHKEY=$(aws ssm get-parameters --region us-east-1 --name "TailscaleRouterAuthKey" --with-decryption --query Parameters[0].Value --output text)
+        tailscale up --authkey $TAILSCALEAUTHKEY --advertise-routes=10.16.0.0/20,10.16.64.0/20
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: TailscaleRouter
+
+# EC2 instance in private subnet to host FTP server.
+# Will have attached EFS storage.
+# Depends on VPC endpoints to connect to SSM & EFS via CLI.
+  TailscalePrivate:
+    Type: AWS::EC2::Instance
+    DependsOn: 
+      - MountTarget
+      - SSMEndpoint
+      - KMSEndpoint
+      - EFSEndpoint
+    Properties:
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      KeyName: PEMKEY
+      InstanceType: t2.micro
+      Monitoring: false
+      SecurityGroupIds:
+        - !Ref PrivateSG
+      UserData: !Base64 |
+        #!/bin/bash
+        yum update -y
+        yum -y install nfs-utils
+        yum install -y amazon-efs-utils
+        yum install -y vsftpd
+        systemctl start vsftpd
+        FTPPWD=$(aws ssm get-parameters --region us-east-1 --name "FTPPassword" --with-decryption --query Parameters[0].Value --output text)
+        adduser tailscaleftp
+        echo $FTPPWD | passwd tailscaleftp --stdin
+        mkdir /mnt/efs
+        chown tailscaleftp:tailscaleftp /mnt/efs
+        EFSID=$(aws efs describe-file-systems --region us-east-1 --query FileSystems[0].FileSystemId --output text)
+        echo -e $EFSID:/ /mnt/efs efs _netdev,noresvport,tls,iam 0 0 >> /etc/fstab
+        mount -a
+        echo -e 'chroot_local_user=YES' >> /etc/vsftpd/vsftpd.conf
+        echo -e 'allow_writeable_chroot=YES' >> /etc/vsftpd/vsftpd.conf
+        echo -e 'local_root=/mnt/efs' >> /etc/vsftpd/vsftpd.conf
+        systemctl restart vsftpd
+        systemctl enable vsftpd
+      SubnetId: !Ref PrivateSubnet
+      Tags:
+        - Key: Name
+          Value: TailscalePrivate
+
+  TailscaleIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref TailscaleRouter
+      Tags:
+        - Key: Name
+          Value: TailscaleIP
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !GetAtt IGW.InternetGatewayId
+
+# Egress only internet gateway provides internet access for private EC2 instance
+# to install FTP server and other packages.
+# Can be removed after initial configuration.
+  EOIGW:
+    Type: AWS::EC2::EgressOnlyInternetGateway
+    Properties: 
+      VpcId: !Ref VPC
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '']
+      CidrBlock: 10.16.0.0/20
+      AssignIpv6AddressOnCreation: true
+      Ipv6CidrBlock: 
+        Fn::Sub:
+          - "${VpcPart}${SubnetPart}"
+          - SubnetPart: '00::/64'
+            VpcPart: !Select [ 0, !Split [ '00::/56', !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks ]]]
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: IPv6CidrBlock
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '']
+      CidrBlock: 10.16.64.0/20
+      AssignIpv6AddressOnCreation: true
+      Ipv6CidrBlock: 
+        Fn::Sub:
+          - "${VpcPart}${SubnetPart}"
+          - SubnetPart: '01::/64'
+            VpcPart: !Select [ 0, !Split [ '00::/56', !Select [ 0, !GetAtt VPC.Ipv6CidrBlocks ]]]
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  
